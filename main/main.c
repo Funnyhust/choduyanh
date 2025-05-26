@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -10,9 +9,10 @@
 #include "lcd/lcd.h"
 
 // Định nghĩa GPIO cho nút bấm
-#define BUTTON_TX_POWER 15  // Nút thay đổi TX Power
-#define BUTTON_SF 16        // Nút thay đổi SF
-#define BUTTON_CR 6         // Nút thay đổi CR
+#define BUTTON_TX_POWER 16  // Nút thay đổi TX Power
+#define BUTTON_SF 15        // Nút thay đổi SF
+#define BUTTON_CR 7         // Nút thay đổi CR
+#define BUTTON_PAUSE_RESUME 6 // Nút dừng/tiếp tục truyền tin
 
 // Biến toàn cục
 static uint8_t tx_power_index = 0;  // Chỉ số công suất: 0->5dBm, 1->10dBm, 2->15dBm, 3->20dBm
@@ -23,12 +23,13 @@ static const uint8_t sf_values[] = {7, 8, 9, 10, 11, 12};  // Các mức SF
 static const uint8_t cr_values[] = {5, 6, 7, 8};           // Các mức CR
 static uint32_t count = 0;  // Biến đếm gói tin
 static SemaphoreHandle_t count_mutex; // Semaphore để bảo vệ count
-// static volatile bool config_changed = false; // Flag báo thay đổi cấu hình
+static TaskHandle_t transmit_task_handle = NULL; // Handle cho transmit_task
+static bool is_transmit_paused = false; // Trạng thái tạm dừng truyền tin
 
 // Hàm cấu hình GPIO cho nút bấm
 void configure_buttons(void) {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BUTTON_TX_POWER) | (1ULL << BUTTON_SF) | (1ULL << BUTTON_CR),
+        .pin_bit_mask = (1ULL << BUTTON_TX_POWER) | (1ULL << BUTTON_SF) | (1ULL << BUTTON_CR) | (1ULL << BUTTON_PAUSE_RESUME),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -51,7 +52,6 @@ bool debounce_button(gpio_num_t pin, bool *last_state) {
 
 // Hàm cập nhật cấu hình LoRa
 void update_lora_config(void) {
-    // lora_idle(); // Đặt module về STDBY trước khi thay đổi cấu hình
     lora_set_frequency(433000000);  // 433 MHz
     lora_set_spreading_factor(sf_values[sf_index]);
     lora_set_bandwidth(125E3);
@@ -69,6 +69,7 @@ void button_task(void *pvParameters) {
     bool last_tx_power_state = false;
     bool last_sf_state = false;
     bool last_cr_state = false;
+    bool last_pause_resume_state = false;
 
     // Cấu hình ban đầu
     update_lora_config();
@@ -81,7 +82,7 @@ void button_task(void *pvParameters) {
             xSemaphoreTake(count_mutex, portMAX_DELAY);
             count = 0;  // Đặt lại count
             xSemaphoreGive(count_mutex);
-                update_lora_config();
+            update_lora_config();
             printf("Changed TX Power to: %d dBm\n", tx_powers[tx_power_index]);
         }
 
@@ -105,6 +106,19 @@ void button_task(void *pvParameters) {
             printf("Changed CR to: 4/%d\n", cr_values[cr_index]);
         }
 
+        // Xử lý nút dừng/tiếp tục truyền tin
+        if (debounce_button(BUTTON_PAUSE_RESUME, &last_pause_resume_state)) {
+            if (is_transmit_paused) {
+                vTaskResume(transmit_task_handle);
+                is_transmit_paused = false;
+                printf("Transmission resumed\n");
+            } else {
+                vTaskSuspend(transmit_task_handle);
+                is_transmit_paused = true;
+                printf("Transmission paused\n");
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10));  // Chờ ngắn để giảm tải CPU
     }
 }
@@ -114,6 +128,8 @@ void lcd_task(void *pvParameters) {
     esp32_lcd_i2c_t *lcd = (esp32_lcd_i2c_t *)pvParameters;
     char line1[17]; // Buffer cho dòng 1 (16 ký tự + null)
     char line2[17]; // Buffer cho dòng 2 (16 ký tự + null)
+    char line3[17]; // Buffer cho dòng 3 (16 ký tự + null)
+    char line4[17]; // Buffer cho dòng 4 (16 ký tự + null) 
     uint32_t last_count = UINT32_MAX; // Đảm bảo cập nhật lần đầu
     uint8_t last_tx_power_index = UINT8_MAX;
     uint8_t last_sf_index = UINT8_MAX;
@@ -135,16 +151,26 @@ void lcd_task(void *pvParameters) {
             cr_index != last_cr_index) {
             
             // Định dạng dòng 1: TX:XX SF:YY (10 ký tự)
-            snprintf(line1, sizeof(line1), "TX:%2d SF:%2d", tx_powers[tx_power_index], sf_values[sf_index]);
+            snprintf(line1, sizeof(line1), "TX:%2d", tx_powers[tx_power_index]);
             
             // Định dạng dòng 2: CR:4/Z CNT:WWW (14 ký tự)
-            snprintf(line2, sizeof(line2), "CR:4/%d CNT:%3lu", cr_values[cr_index], current_count % 1000);
+            snprintf(line2, sizeof(line2), "SF:%2d", sf_values[sf_index]);
+                        // Định dạng dòng 2: CR:4/Z CNT:WWW (14 ký tự)
+            snprintf(line3, sizeof(line3), "CR:4/%d", cr_values[cr_index]);
+                        // Định dạng dòng 2: CR:4/Z CNT:WWW (14 ký tự)
+            snprintf(line4, sizeof(line4), "COUNT:%3lu", current_count % 1000);
 
             // Hiển thị trên LCD
             esp32_lcd_i2c_set_cursor(lcd, 0, 0);
             esp32_lcd_i2c_print(lcd, line1);
             esp32_lcd_i2c_set_cursor(lcd, 0, 1);
             esp32_lcd_i2c_print(lcd, line2);
+            esp32_lcd_i2c_set_cursor(lcd, -4, 2);
+            esp32_lcd_i2c_print(lcd, line3);
+            esp32_lcd_i2c_set_cursor(lcd, -4, 3);
+            esp32_lcd_i2c_print(lcd, line4);
+            // Đảm bảo không có ký tự thừa
+
 
             // Log để debug
             printf("LCD Update: %s | %s (Count: %lu)\n", line1, line2, current_count);
@@ -162,19 +188,14 @@ void lcd_task(void *pvParameters) {
 
 // Task gửi gói tin
 void transmit_task(void *pvParameters) {
-    // Chuẩn bị chuỗi 128 byte chứa 0xAA
-char json_msg[128];
-        float temp = 28.5;
-        float moisture = 70.2;
-        snprintf(json_msg, sizeof(json_msg),
-                 "{\"id\":\"DEVICE_001\",\"temp\":%.1f,\"moisture\":%.1f}",
-                 temp, moisture);
+    // MODIFIED: Chuẩn bị chuỗi 16 byte (128 bit) chứa toàn 0xAA
+    uint8_t msg[128];
+    memset(msg, 0xAA, sizeof(msg));
 
     while (1) {
-        // Kiểm tra nếu cấu hình LoRa thay đổi
         // Gửi gói tin
         printf("Sending packet %lu...\n", count + 1);
-               lora_send_packet((uint8_t *)json_msg, strlen(json_msg));
+        lora_send_packet(msg, sizeof(msg)); // MODIFIED: Gửi chuỗi 16 byte
         xSemaphoreTake(count_mutex, portMAX_DELAY);
         count++;
         xSemaphoreGive(count_mutex);
@@ -185,7 +206,7 @@ char json_msg[128];
                tx_powers[tx_power_index], sf_values[sf_index], cr_values[cr_index]);
         printf("Count: %lu\n", count);
 
-        // Chờ 7 giây
+        // Chờ 1 giây
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -200,7 +221,7 @@ void app_main(void) {
 
     // Khởi tạo LCD
     static esp32_lcd_i2c_t lcd;
-    esp_err_t ret = esp32_lcd_i2c_init(&lcd, 0x27, 16, 2, I2C_NUM_0, 46, 2);
+    esp_err_t ret = esp32_lcd_i2c_init(&lcd, 0x27, 16, 4, I2C_NUM_0, 46, 2);
     if (ret != ESP_OK) {
         printf("LCD init failed: %s\n", esp_err_to_name(ret));
         return;
@@ -220,6 +241,6 @@ void app_main(void) {
 
     // Tạo các task
     xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
-    xTaskCreate(transmit_task, "transmit_task", 4096, NULL, 5, NULL);
+    xTaskCreate(transmit_task, "transmit_task", 4096, NULL, 5, &transmit_task_handle);
     xTaskCreate(lcd_task, "lcd_task", 4096, &lcd, 5, NULL);
 }
