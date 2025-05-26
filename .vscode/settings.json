@@ -1,0 +1,8 @@
+{
+    "idf.pythonInstallPath": "D:\\Espressif\\tools\\idf-python\\3.11.2\\python.exe",
+    "files.associations": {
+        "string.h": "c",
+        "lcd.h": "c",
+        "stdio.h": "c"
+    }
+}
